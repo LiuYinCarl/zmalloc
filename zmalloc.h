@@ -1,6 +1,11 @@
 #pragma once
 
 #include <assert.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <memory.h>
 
 
 #define ZDEBUG
@@ -14,6 +19,23 @@
 #define zlog(format, ...)
 #endif
 
+// --------------------------------------------------------------------
+#define max_alloc_size 1024 - 8
+#define init_page_num 10
+#define alloc_page_num 10
+#define page_size 1024
+#define header_size 8
+#define ptr_size 8
+
+const static int32_t slot_count = 32;
+const static int32_t slot_size[] = {
+  24,  56,  88,  120, 152, 184, 216, 248,
+  280, 312, 344, 376, 408, 440, 472, 504,
+  536, 568, 600, 632, 664, 696, 728, 760,
+  792, 824, 856, 888, 920, 952, 984, 1016 };
+
+
+
 // -------------- Znode -------------------------
 
 typedef struct Znode {
@@ -24,13 +46,13 @@ typedef struct Znode {
 
 inline int32_t is_linked(Znode* node) {
   assert(node);
-  return (node->pprev || node->pprev);
+  return (node->prev || node->prev);
 }
 
 inline void remove_self(Znode* node) {
   zassert(node);
   if (node->prev) node->prev->next = node->next;
-  if (node->next) node->next->pprev = node->prev;
+  if (node->next) node->next->prev = node->prev;
   node->next = NULL;
   node->prev = NULL;
 }
@@ -66,7 +88,7 @@ static inline void list_clear(Zlist* list) {
   list->len = 0;
 }
 
-static inline void list_head_insert(Zlist* list, Znode* node) {
+static inline void list_add_head(Zlist* list, Znode* node) {
   zassert(list);
   zassert(node);
   if (!list->head->next) { // empty list
@@ -79,8 +101,8 @@ static inline void list_head_insert(Zlist* list, Znode* node) {
   }
 }
 
-static inline void list_tail_insert(Zlist* list, Znode* node) {
-  zaseert(list);
+static inline void list_add_tail(Zlist* list, Znode* node) {
+  zassert(list);
   zassert(node);
   if (!list->tail->prev) { // empty list
     list->head->next = node;
@@ -90,6 +112,26 @@ static inline void list_tail_insert(Zlist* list, Znode* node) {
     node->prev = list->tail;
     list->tail = node;
   }
+}
+
+static inline void* list_remove_head(Zlist* list) {
+  zassert(list);
+  zassert(list->head->next);
+  Znode* node = list->head->next;
+  if (node->next) {  // more than one node on list
+    list->head->next = node->next;
+    node->next->prev = list->head;
+  } else { // only one node on list
+    list->head->next = NULL;  // todo
+    list->tail = NULL;
+  }
+
+  node->prev = node->next = NULL;
+  return node;
+}
+
+static inline void list_remove_tail(Zlist* list) {
+  zassert(list);
 }
 
 static inline void list_remove_node(Zlist* list, Znode* node) {
@@ -113,27 +155,25 @@ size_t free_page_pos = -1;
 #define blocks_per_page(page_size, block_size) \
   (page_size / block_size)  // todo: 优化除法
 
-static inline size_t next_block_size(size_t size) {
+static inline size_t next_blocksize(size_t size) {
   const static size_t ALIGN = 32;
   const static size_t max = 1 << 14;  // max = 16K
   size_t n = ((size + ALIGN - 1) & ~(ALIGN - 1));
   return n >= max ? max : n;
 }
 
-// --------------------------------------------------------------------
-#define max_alloc_size 1024 - 8
-#define init_page_num 10
-#define alloc_page_num 10
-#define page_size 1024
-#define header_size 8
-#define ptr_size 8
-
-const static int32_t slot_count = 32;
-const static int32_t slot_size[] = {
-  24,  56,  88,  120, 152, 184, 216, 248,
-  280, 312, 344, 376, 408, 440, 472, 504,
-  536, 568, 600, 632, 664, 696, 728, 760,
-  792, 824, 856, 888, 920, 952, 984, 1016 };
+static inline size_t get_pos_by_blocksize(size_t blockSize) {
+  mem_assert(blockSize > 0);
+  mem_assert(blockSize % 32 == 0);
+  int n = 0;
+  int bs = blockSize;
+  bs = bs >> 6;  // bs = bs / 32
+  while (bs > 0) {
+    ++n;
+    bs = bs >> 1;
+  }
+  return n;
+}
 
 
 // -------------------------------------------------------------------
@@ -142,11 +182,25 @@ typedef struct Zpage {
   void* ppage;
   void** stack;
   size_t blocksize;
+  size_t usersize;  // blocksize - header(8)
   size_t blocknum;
   size_t tailpos;
   size_t hasspace;
   Zslab* slab;
 } Zpage;
+
+typedef struct Zslab {
+  Zlist* pagelist;
+  size_t pagenum;
+  Zslot* minfreeslot;
+} Zslab;
+
+typedef struct Zpool {
+  Zslab slabs[slot_count];
+  void* blockcaches[slot_count];
+} Zpool;
+
+Zpool pool;
 
 static inline void* set_block_header(void* pblock, void* ppage) {
   void* h = pblock;
@@ -158,19 +212,19 @@ static inline void* get_block_header(void* pblock) {
   return pblock - 1;
 }
 
-static inline void page_init(Zpage* page, Zslab* slab, size_t block_size) {
+static inline void page_init(Zpage* page, Zslab* slab, size_t blocksize) {
   zassert(page);
   zassert(slab);
-  zassert(block_size % 32 == 0);
+  zassert(blocksize % 32 == 0);
   page->ppage = allocmem();
-  page->blocksize = block_size;
-  page->blocknum = blocks_per_page(page_size, block_size);
+  page->blocksize = blocksize;
+  page->blocknum = blocks_per_page(page_size, blocksize);
   page->slab = slab;
 
   char* block = page->ppage;
   page->stack = malloc(page->blocknum * sizeof(void*));
   for (size_t i = 0; i < page->blocknum; ++i) {
-    void* p = (block + i * block_size);
+    void* p = (block + i * blocksize);
     page->stack[i] = set_block_header(p, page);
   }
 
@@ -184,11 +238,30 @@ static inline page_uninit(Zpage* page) {
   free(page->stack)
 }
 
+static inline void* page_alloc(Zpage* page) {
+  zassert(page->tailpos >= 0);
+  zassert(page.tailpos < page->blocknum);
+  void* ptr = page->stack[page->tailpos];
+
+  if (--page->tailpos < 0) {
+    page->hasspace = false;
+    Znode* node = page->slab->freelist.removehead();
+    page->slab->fulllist.addtail();
+    slab_find_min_freeslot(page->slab);
+  }
+  return ptr;
+}
+
+static inline void page_free(Zpage* page, void* ptr) {
+  ++page->tailpos;
+  page->hasspace = true;
+  zassert(page->tailpos >= 0);
+  zassert(page->tailpos < page->blocknum);
+  page->stack[page->tailpos] = ptr;
+  // todo memset the block
+}
+
 // ----------------------------------------------------------------
-typedef struct Zslab {
-  Zlist* pagelist;
-  size_t pagenum;
-} Zslab;
 
 static inline void slab_init(Zslab* slab, size_t blocksize) {
   slab->pagelist = malloc(sizeof(Zlist));
@@ -224,15 +297,40 @@ static inline void slab_del_page(Zpage* node) {
   page_uninit(page);
 }
 
+static inline void* slab_alloc(Zslab* slab) {
+  
+}
 
+static inline void find_min_freeslot(Zslab* slab) {
+  zassert(slab);
+  Zlist* freelist = slab->freelist;
+  Zlist* fulllist = slab->fulllist;
+  Zpage* minfreepage = NULL;
+  if (freelist->len > 0) {
+    minfreepage = freelist->head->val;
+  } else {
+    Znode* node = NULL;
+    Znode* next = NULL;
+    node = fulllist->head;
+    while (node) {
+      next = node_get_next(node);
+      if (node->val->hasspace) {
+        node_remove_self(node);
+        list_add_head(freelist, node);
+      }
+      node = next;
+    }
+    if (freelist->len == 0) {  // can't get freepage from fulllist
+      slab_new_page(slab);
+    }
+    zassert(freelist->len > 0);
+    slab->minfreeslot = list_get_head(freelist)->val;
+  }
+}
 
 // ----------------------------------------------------------------
-typedef struct Zpool {
-  Zslabs slabs[slot_count];
-  void* blockcaches[slot_count];
-} Zpool;
 
-Zpool pool;
+
 
 
 static inline void zinit() {
@@ -248,21 +346,39 @@ static inline void zuninit() {
 }
 
 
-static inline void* zalloc() {
+static inline void* zalloc(size_t size) {
+  zassert(size >= 0);
+  size_t sz = next_blocksize(size);
+  size_t pos = get_pos_by_blocksize(sz);
 
+  zassert(pos > 0);
+  zlog("pos:%ld", pos);
+  zlog("slab*:%p", pool.slabs[pos]);
+  Zslab* slab = pool.slabs[pos];
+  void* ptr = slab_alloc();
+  zassert(ptr);
+  return ptr;
 }
 
 static inline void zfree(void* ptr) {
-
+  zassert(ptr);
+  Zpage* page = get_block_header(ptr);
+  page_free(page, ptr);
 }
 
-static inline void zrealloc(void* ptr, size_t size) {
-
+static inline void* zrealloc(void* ptr, size_t size) {
+  zassert(ptr);
+  zassert(size >= 0);
+  Zpage* page = get_block_header(ptr);
+  if (size <= page->usersize) {
+    return ptr;
+  } else { // expand
+    void* newptr = zalloc(size);
+    mmecpy(newptr, ptr, page->usersize);
+    page_free(page, ptr);
+    return newptr;
+  }
 }
-
-
-
-
 
 // ---------------------------------------------------------------
 static inline void* z_lalloc(void* ud, void* ptr, size_t osize, size_t nsize) {
@@ -291,7 +407,7 @@ static inline void* z_lalloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     memcpy(p, ptr, osize);
     zfree(ptr);
     return p;
-  } else if (osize > max_alloc_size && nsizs <= max_alloc_size) {
+  } else if (osize > max_alloc_size && nsize <= max_alloc_size) {
     p = zalloc(nsize);
     memcpy(p, ptr, nsize);
     free(ptr);
